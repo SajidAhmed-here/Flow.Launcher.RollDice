@@ -3,39 +3,140 @@ name: Publish Release
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-    paths-ignore:
-      - .github/workflows/*
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Serialize publishing so two runs cannot replace the same asset concurrently.
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: [3.8]
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PACKAGE_DIR: .release-package
+      ARCHIVE_PATH: Flow.Launcher.Plugin.RollDice.zip
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: python {0}
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+      - name: Check out source
+        uses: actions/checkout@v6
         with:
-          python-version: ${{ matrix.python-version }}
-      - name: get version
-        id: version
-        uses: notiz-dev/github-action-json-property@release
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
-          path: 'plugin.json'
-          prop_path: 'Version'
-      - run: echo ${{steps.version.outputs.prop}}
-      - name: Install dependencies
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Validate metadata and stage plugin
+        id: metadata
         run: |
-          python -m pip install --upgrade pip
-          pip install -r ./requirements.txt -t ./lib
-          zip -r Flow.Launcher.Plugin.RollDice.zip . -x '*.git*'
-      - name: Publish
-        if: success()
-        uses: softprops/action-gh-release@v1
+          import ast
+          import json
+          import os
+          import re
+          import shutil
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd()
+          metadata = json.loads((root / 'plugin.json').read_text(encoding='utf-8'))
+          version = metadata['Version']
+          if not isinstance(version, str) or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise ValueError('plugin.json Version must have the form X.Y.Z')
+          if metadata['Language'].lower() != 'python':
+              raise ValueError('This workflow packages a Python plugin')
+
+          for field in ('ExecuteFileName', 'IcoPath'):
+              relative = PurePosixPath(metadata[field].replace('\\', '/'))
+              if relative.is_absolute() or '..' in relative.parts:
+                  raise ValueError(f'Invalid plugin path: {field}')
+              if not (root / relative).is_file():
+                  raise FileNotFoundError(metadata[field])
+
+          for source in (root / 'main.py', *(root / 'plugin').rglob('*.py')):
+              ast.parse(source.read_text(encoding='utf-8'), filename=str(source))
+
+          package = Path(os.environ['PACKAGE_DIR'])
+          package.mkdir(parents=True, exist_ok=False)
+          for name in ('main.py', 'plugin.json', 'requirements.txt', 'README.md'):
+              shutil.copy2(root / name, package / name)
+          for name in ('plugin', 'assets'):
+              shutil.copytree(root / name, package / name,
+                              ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'tag=v{version}\n')
+              output.write(f'archive={Path(os.environ["ARCHIVE_PATH"]).resolve().as_posix()}\n')
+
+      - name: Bundle and check dependencies
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          lib = Path(os.environ['PACKAGE_DIR']) / 'lib'
+          subprocess.run([
+              sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+              '--no-compile', '--requirement', 'requirements.txt', '--target', str(lib)
+          ], check=True)
+          # Make pip inspect the bundled distributions and their requirements.
+          environment = dict(os.environ, PYTHONPATH=str(lib))
+          subprocess.run([sys.executable, '-m', 'pip', 'check'],
+                         env=environment, check=True)
+
+      - name: Build ZIP and verify packaged entry point
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          package = Path(os.environ['PACKAGE_DIR'])
+          archive = Path(os.environ['ARCHIVE_PATH'])
+          with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
+              for path in sorted(package.rglob('*')):
+                  if path.is_file():
+                      bundle.write(path, path.relative_to(package).as_posix())
+
+          with tempfile.TemporaryDirectory() as directory:
+              with ZipFile(archive) as bundle:
+                  if bundle.testzip() is not None:
+                      raise RuntimeError('Release ZIP failed its integrity check')
+                  bundle.extractall(directory)
+              root = Path(directory)
+              metadata = json.loads((root / 'plugin.json').read_text(encoding='utf-8'))
+              request = json.dumps({'method': 'query', 'parameters': ['1d1']})
+              result = subprocess.run(
+                  [sys.executable, str(root / metadata['ExecuteFileName']), request],
+                  cwd=root, check=True, capture_output=True, text=True, timeout=30
+              )
+              response = json.loads(result.stdout)
+              messages = response.get('result') or []
+              if not messages or messages[0].get('Title') != 'Total result: 1':
+                  raise RuntimeError(f'Packaged plugin smoke check failed: {response}')
+          print(f'Validated release package: {archive.name}')
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          files: 'Flow.Launcher.Plugin.RollDice.zip'
-          tag_name: "v${{steps.version.outputs.prop}}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.metadata.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: ${{ steps.metadata.outputs.archive }}
+          fail_on_unmatched_files: true
+          # Preserve the previous workflow's ability to refresh an existing asset.
+          overwrite_files: true
